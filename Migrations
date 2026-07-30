@@ -1,0 +1,93 @@
+/*
+# Chronicle Blog Platform — Extended Schema
+
+## Summary
+Extends the existing blog schema with two unique features:
+1. `post_claps` — users can send up to 50 claps per post (medium-style appreciation)
+2. `comment_reactions` — emoji reactions on individual comments
+3. `follows` — users can follow other authors
+4. Adds `category` and `reading_time` columns to posts for magazine-style filtering
+
+## Changes to existing tables
+- posts: add `category` text column, `reading_time` integer column, `subtitle` text column
+
+## New tables
+- `post_claps` (post_id, user_id, count) — clap count per user per post, max 50
+- `follows` (follower_id, following_id) — author follow graph
+*/
+
+-- Add subtitle, category, reading_time to posts if not present
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='posts' AND column_name='subtitle') THEN
+    ALTER TABLE posts ADD COLUMN subtitle text DEFAULT '';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='posts' AND column_name='category') THEN
+    ALTER TABLE posts ADD COLUMN category text DEFAULT 'General';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='posts' AND column_name='reading_time') THEN
+    ALTER TABLE posts ADD COLUMN reading_time integer DEFAULT 1;
+  END IF;
+END $$;
+
+-- POST CLAPS (up to 50 per user per post)
+CREATE TABLE IF NOT EXISTS post_claps (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  post_id uuid NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+  count integer NOT NULL DEFAULT 1 CHECK (count >= 1 AND count <= 50),
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  UNIQUE(post_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS post_claps_post_id_idx ON post_claps(post_id);
+
+ALTER TABLE post_claps ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "claps_select" ON post_claps;
+CREATE POLICY "claps_select" ON post_claps FOR SELECT TO anon, authenticated USING (true);
+
+DROP POLICY IF EXISTS "claps_insert" ON post_claps;
+CREATE POLICY "claps_insert" ON post_claps FOR INSERT TO authenticated WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "claps_update" ON post_claps;
+CREATE POLICY "claps_update" ON post_claps FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "claps_delete" ON post_claps;
+CREATE POLICY "claps_delete" ON post_claps FOR DELETE TO authenticated USING (auth.uid() = user_id);
+
+-- FOLLOWS
+CREATE TABLE IF NOT EXISTS follows (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  follower_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
+  following_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  created_at timestamptz DEFAULT now(),
+  UNIQUE(follower_id, following_id)
+);
+
+CREATE INDEX IF NOT EXISTS follows_follower_idx ON follows(follower_id);
+CREATE INDEX IF NOT EXISTS follows_following_idx ON follows(following_id);
+
+ALTER TABLE follows ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "follows_select" ON follows;
+CREATE POLICY "follows_select" ON follows FOR SELECT TO anon, authenticated USING (true);
+
+DROP POLICY IF EXISTS "follows_insert" ON follows;
+CREATE POLICY "follows_insert" ON follows FOR INSERT TO authenticated WITH CHECK (auth.uid() = follower_id);
+
+DROP POLICY IF EXISTS "follows_delete" ON follows;
+CREATE POLICY "follows_delete" ON follows FOR DELETE TO authenticated USING (auth.uid() = follower_id);
+
+DROP POLICY IF EXISTS "follows_update" ON follows;
+CREATE POLICY "follows_update" ON follows FOR UPDATE TO authenticated USING (auth.uid() = follower_id) WITH CHECK (auth.uid() = follower_id);
+
+-- Trigger for post_claps updated_at
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN NEW.updated_at = now(); RETURN NEW; END;
+$$;
+
+DROP TRIGGER IF EXISTS post_claps_updated_at ON post_claps;
+CREATE TRIGGER post_claps_updated_at BEFORE UPDATE ON post_claps
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
